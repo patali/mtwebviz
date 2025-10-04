@@ -10,36 +10,296 @@ func HandleFrontend(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprint(w, `<!DOCTYPE html>
 <html>
-<head><title>Touchpad Visualizer</title></head>
+<head>
+    <title>Touchpad Visualizer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+        #status-bar {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 100;
+        }
+        #status { font-weight: bold; }
+        #fullscreen-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            border: 2px solid #444;
+            padding: 10px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            z-index: 100;
+        }
+        #fullscreen-btn:hover {
+            background: rgba(0,0,0,0.9);
+            border-color: #666;
+        }
+    </style>
+</head>
 <body>
-<h1>Multitouch WebSocket Server</h1>
-<p>WebSocket endpoint: <code>ws://localhost:8080/ws</code></p>
-<p>Status: <span id="status">Connecting...</span></p>
-<pre id="output"></pre>
+<div id="status-bar">
+    <div>Multitouch Visualizer</div>
+    <div>Status: <span id="status">Connecting...</span></div>
+</div>
+<button id="fullscreen-btn">Fullscreen</button>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 const ws = new WebSocket('ws://localhost:8080/ws');
 const status = document.getElementById('status');
-const output = document.getElementById('output');
 
+// Three.js setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a0a);
+
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(0, 30, 40);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// Grid configuration (16:10 ratio for trackpad)
+const GRID_WIDTH = 64;
+const GRID_HEIGHT = 40;
+const GRID_SPACING = 1;
+const cubes = [];
+const cubeData = [];
+
+// Heat map colors (blue -> cyan -> green -> yellow -> red)
+const heatColors = [
+    new THREE.Color(0x0000ff), // cold - blue
+    new THREE.Color(0x00ffff), // cyan
+    new THREE.Color(0x00ff00), // green
+    new THREE.Color(0xffff00), // yellow
+    new THREE.Color(0xff0000)  // hot - red
+];
+
+function getHeatColor(intensity) {
+    const index = Math.min(intensity * (heatColors.length - 1), heatColors.length - 1);
+    const lower = Math.floor(index);
+    const upper = Math.ceil(index);
+    const t = index - lower;
+
+    if (lower === upper) return heatColors[lower].clone();
+
+    const color = heatColors[lower].clone();
+    color.lerp(heatColors[upper], t);
+    return color;
+}
+
+// Create grid of cubes
+for (let x = 0; x < GRID_WIDTH; x++) {
+    cubes[x] = [];
+    cubeData[x] = [];
+    for (let z = 0; z < GRID_HEIGHT; z++) {
+        const geometry = new THREE.BoxGeometry(0.8, 0.5, 0.8);
+        const material = new THREE.MeshPhongMaterial({
+            color: 0x333333,
+            shininess: 30
+        });
+        const cube = new THREE.Mesh(geometry, material);
+
+        cube.position.x = (x - GRID_WIDTH / 2) * GRID_SPACING;
+        cube.position.z = (z - GRID_HEIGHT / 2) * GRID_SPACING;
+        cube.position.y = 0.25;
+
+        scene.add(cube);
+        cubes[x][z] = cube;
+
+        cubeData[x][z] = {
+            targetHeight: 0.5,
+            currentHeight: 0.5,
+            velocity: 0,
+            heat: 0,
+            targetHeat: 0
+        };
+    }
+}
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(0x404040, 2);
+scene.add(ambientLight);
+
+const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+directionalLight.position.set(10, 20, 10);
+scene.add(directionalLight);
+
+const pointLight = new THREE.PointLight(0x4444ff, 1, 100);
+pointLight.position.set(0, 15, 0);
+scene.add(pointLight);
+
+// Touch data processing
+function updateCubesFromTouchData(touchData) {
+    const hasFingers = touchData && touchData.fingers && touchData.fingers.length > 0;
+
+    // First, reset all cubes to base state
+    for (let x = 0; x < GRID_WIDTH; x++) {
+        for (let z = 0; z < GRID_HEIGHT; z++) {
+            // If no fingers, reset immediately
+            if (!hasFingers) {
+                cubeData[x][z].targetHeight = 0.5;
+                cubeData[x][z].targetHeat = 0;
+            } else {
+                // Decay existing values
+                cubeData[x][z].targetHeight *= 0.9;
+                cubeData[x][z].targetHeat *= 0.85;
+
+                // Snap to base when very close
+                if (cubeData[x][z].targetHeight < 0.52) {
+                    cubeData[x][z].targetHeight = 0.5;
+                }
+                if (cubeData[x][z].targetHeat < 0.02) {
+                    cubeData[x][z].targetHeat = 0;
+                }
+            }
+        }
+    }
+
+    if (!hasFingers) return;
+
+    // Process each finger
+    touchData.fingers.forEach(finger => {
+        // Normalize coordinates to grid (x,y are already 0-1 from normalized.pos)
+        // Invert Y axis: 1 - finger.y
+        const gridX = Math.floor(finger.x * GRID_WIDTH);
+        const gridZ = Math.floor((1 - finger.y) * GRID_HEIGHT);
+
+        // Map finger size to height (size is typically 0-2, scale to reasonable height)
+        const height = 0.5 + Math.min(finger.size, 2) * 7.5;
+
+        // Apply to surrounding cubes with falloff for smooth effect
+        const radius = 3;
+        for (let dx = -radius; dx <= radius; dx++) {
+            for (let dz = -radius; dz <= radius; dz++) {
+                const x = gridX + dx;
+                const z = gridZ + dz;
+
+                if (x >= 0 && x < GRID_WIDTH && z >= 0 && z < GRID_HEIGHT) {
+                    const distance = Math.sqrt(dx * dx + dz * dz);
+                    const falloff = Math.max(0, 1 - distance / radius);
+                    const contribution = height * falloff;
+
+                    if (contribution > cubeData[x][z].targetHeight) {
+                        cubeData[x][z].targetHeight = contribution;
+                    }
+
+                    // Update heat with contribution
+                    cubeData[x][z].targetHeat = Math.min(1, cubeData[x][z].targetHeat + falloff * 0.5);
+                }
+            }
+        }
+    });
+}
+
+// Animation loop
+function animate() {
+    requestAnimationFrame(animate);
+
+    // Smooth animations with spring physics
+    for (let x = 0; x < GRID_WIDTH; x++) {
+        for (let z = 0; z < GRID_HEIGHT; z++) {
+            const data = cubeData[x][z];
+            const cube = cubes[x][z];
+
+            // Spring-damper system for height
+            const heightDiff = data.targetHeight - data.currentHeight;
+            const springForce = heightDiff * 0.15;
+            const damping = data.velocity * 0.7;
+            data.velocity += springForce - damping;
+            data.currentHeight += data.velocity;
+
+            // Snap to target when very close
+            if (Math.abs(data.currentHeight - data.targetHeight) < 0.01) {
+                data.currentHeight = data.targetHeight;
+                data.velocity = 0;
+            }
+
+            // Update cube height
+            cube.scale.y = data.currentHeight;
+            cube.position.y = data.currentHeight / 2;
+
+            // Smooth heat transition
+            data.heat += (data.targetHeat - data.heat) * 0.1;
+
+            // Snap heat to target when very close
+            if (Math.abs(data.heat - data.targetHeat) < 0.001) {
+                data.heat = data.targetHeat;
+            }
+
+            // Update color based on heat
+            const color = getHeatColor(data.heat);
+            cube.material.color.copy(color);
+        }
+    }
+
+    renderer.render(scene, camera);
+}
+
+// WebSocket handlers
 ws.onopen = () => {
     status.textContent = 'Connected';
-    status.style.color = 'green';
+    status.style.color = '#00ff00';
 };
 
 ws.onmessage = (event) => {
     const data = JSON.parse(event.data);
-    output.textContent = JSON.stringify(data, null, 2);
+    // Debug: log finger count
+    if (data.fingers && data.fingers.length > 0) {
+        console.log('Fingers:', data.fingers.length);
+    }
+    updateCubesFromTouchData(data);
 };
 
 ws.onerror = (error) => {
     status.textContent = 'Error';
-    status.style.color = 'red';
+    status.style.color = '#ff0000';
 };
 
 ws.onclose = () => {
     status.textContent = 'Disconnected';
-    status.style.color = 'red';
+    status.style.color = '#ff0000';
 };
+
+// Handle window resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Fullscreen button
+const fullscreenBtn = document.getElementById('fullscreen-btn');
+fullscreenBtn.addEventListener('click', () => {
+    if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen();
+        fullscreenBtn.textContent = 'Exit Fullscreen';
+    } else {
+        document.exitFullscreen();
+        fullscreenBtn.textContent = 'Fullscreen';
+    }
+});
+
+// Update button text when fullscreen state changes
+document.addEventListener('fullscreenchange', () => {
+    if (document.fullscreenElement) {
+        fullscreenBtn.textContent = 'Exit Fullscreen';
+    } else {
+        fullscreenBtn.textContent = 'Fullscreen';
+    }
+});
+
+// Start animation
+animate();
 </script>
 </body>
 </html>`)
